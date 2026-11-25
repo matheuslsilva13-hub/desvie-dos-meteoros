@@ -35,7 +35,6 @@ const ASSETS = {
   }
 };
 
-// Valores sincronizados automaticamente com o server.js
 let playerSpeed = 290;
 let dashSpeed = 680;
 let dashDuration = 0.16;
@@ -59,7 +58,6 @@ for (const [name, src] of Object.entries(ASSETS.characters)) {
   characterImages[name] = image;
 }
 
-// Sintetizador leve de efeitos sonoros (sem arquivos externos)
 let audioCtx = null;
 function playTone(freq, endFreq, duration, type = 'sine', volume = 0.08) {
   try {
@@ -85,7 +83,6 @@ function playTone(freq, endFreq, duration, type = 'sine', volume = 0.08) {
   }
 }
 
-// Pré-renderiza o fundo uma única vez
 const bgCanvas = document.createElement('canvas');
 bgCanvas.width = canvas.width;
 bgCanvas.height = canvas.height;
@@ -126,13 +123,13 @@ let currentState = {
   gameState: GAME_STATES.WAITING,
   players: {},
   meteors: [],
+  powerups: [],
   roundNumber: 0,
   countdownSeconds: null,
   elapsedSeconds: 0,
   winner: null
 };
 
-// Estado local predito para resposta instantânea
 let predictedSelf = null;
 let localDashTimer = 0;
 let localDashCooldown = 0;
@@ -142,9 +139,7 @@ const visualPlayers = new Map();
 const meteorShapes = new Map();
 const dashTrails = [];
 
-// Controle Touch para celular
 let touchTarget = null;
-
 let feedTimer = null;
 let hudUpdateScheduled = false;
 const heldKeys = new Set();
@@ -176,7 +171,6 @@ function currentInput() {
     else if (dir === 'right') right = true;
   }
 
-  // Suporte ao toque na tela (celular/tablet)
   if (touchTarget && predictedSelf) {
     const dx = touchTarget.x - predictedSelf.x;
     const dy = touchTarget.y - predictedSelf.y;
@@ -281,7 +275,6 @@ window.addEventListener('blur', () => {
   }
 });
 
-// Eventos Touch no Canvas (para pilotar no celular)
 function updateTouchCoords(touch) {
   const rect = canvas.getBoundingClientRect();
   touchTarget = {
@@ -372,7 +365,7 @@ socket.on('initState', (payload) => {
   lastInputSignature = '';
   sendInput(true);
   updateHud();
-  showEvent('Controles: WASD/Setas para mover | ESPAÇO para Dash!');
+  showEvent('Colete orbes azuis (Escudo) e estrelas douradas (+10s)!');
 });
 
 socket.on('gameState', (snapshot) => {
@@ -405,9 +398,19 @@ socket.on('gameState', (snapshot) => {
   scheduleHudUpdate();
 });
 
+socket.on('powerupCollected', ({ type, message }) => {
+  if (type === 'shield') {
+    playTone(520, 880, 0.22, 'sine', 0.12);
+  } else {
+    playTone(660, 1100, 0.24, 'triangle', 0.12);
+  }
+  showEvent(message);
+  updateHud();
+});
+
 socket.on('shieldBroken', () => {
   playTone(480, 140, 0.25, 'sawtooth', 0.12);
-  showEvent('Escudo destruído! Cuidado com o próximo impacto!', true);
+  showEvent('Escudo destruído! Pegue um orbe azul para recuperar!', true);
 });
 
 socket.on('playerJoined', (player) => {
@@ -462,7 +465,7 @@ function updateHud() {
     case GAME_STATES.PLAYING:
       setBanner(`Tempo: ${currentState.elapsedSeconds || 0}s`, 'playing');
       roundStatus.textContent = 'Desvie dos meteoros';
-      roundHint.textContent = 'WASD/Setas: mover • Espaço/Duplo-toque: Dash';
+      roundHint.textContent = 'Colete itens azuis (Escudo) e dourados (+10s)';
       roundStatusDot.className = 'round-status-dot playing';
       break;
     case GAME_STATES.ROUND_OVER: {
@@ -564,6 +567,59 @@ function getMeteorOffsets(meteor) {
   return offsets;
 }
 
+function drawPowerup(pu, now) {
+  // Pisca quando falta menos de 2.5s para desaparecer
+  if (pu.ttl < 2.5 && Math.floor(now / 140) % 2 === 0) return;
+
+  const pulse = 1 + Math.sin(now / 180) * 0.14;
+  const r = (pu.radius || 14) * pulse;
+  const isShield = pu.type === 'shield';
+
+  ctx.save();
+  ctx.translate(pu.x, pu.y);
+
+  // Halo externo pulsante
+  ctx.beginPath();
+  ctx.arc(0, 0, r + 6, 0, Math.PI * 2);
+  ctx.fillStyle = isShield ? 'rgba(99, 228, 255, 0.18)' : 'rgba(251, 191, 36, 0.2)';
+  ctx.fill();
+
+  if (isShield) {
+    // Orbe ciano de Escudo
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.fillStyle = '#0ea5e9';
+    ctx.fill();
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = '#bae6fd';
+    ctx.stroke();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 11px Inter, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('S', 0, 1);
+  } else {
+    // Estrela dourada de +10s
+    ctx.rotate((now / 900) % (Math.PI * 2));
+    ctx.beginPath();
+    for (let i = 0; i < 10; i += 1) {
+      const rad = i % 2 === 0 ? r : r * 0.48;
+      const ang = (i * Math.PI) / 5;
+      if (i === 0) ctx.moveTo(Math.cos(ang) * rad, Math.sin(ang) * rad);
+      else ctx.lineTo(Math.cos(ang) * rad, Math.sin(ang) * rad);
+    }
+    ctx.closePath();
+    ctx.fillStyle = '#fbbf24';
+    ctx.fill();
+    ctx.lineWidth = 1.8;
+    ctx.strokeStyle = '#fef3c7';
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
 function drawMeteor(meteor, extrapSeconds) {
   const x = meteor.x + (meteor.vx || 0) * extrapSeconds;
   const y = meteor.y + (meteor.vy || 0) * extrapSeconds;
@@ -614,7 +670,6 @@ function drawPlayer(player, renderX, renderY) {
   ctx.save();
   if (ghost) ctx.globalAlpha = 0.35;
 
-  // Aura azul do Escudo ativo
   if (!ghost && player.shield) {
     ctx.strokeStyle = 'rgba(99, 228, 255, 0.8)';
     ctx.fillStyle = 'rgba(99, 228, 255, 0.12)';
@@ -641,7 +696,6 @@ function drawPlayer(player, renderX, renderY) {
     ctx.fill();
   }
 
-  // Barra de recarga do Dash abaixo da nave do próprio jogador
   if (!ghost && player.id === myPlayerId) {
     const barW = 34;
     const barH = 4;
@@ -715,7 +769,6 @@ function render(now) {
   stepLocalPrediction(dt);
   ctx.drawImage(bgCanvas, 0, 0);
 
-  // Rastro visual do Dash
   for (let i = dashTrails.length - 1; i >= 0; i -= 1) {
     const t = dashTrails[i];
     t.alpha -= dt * 2.5;
@@ -727,6 +780,11 @@ function render(now) {
     ctx.beginPath();
     ctx.arc(t.x, t.y, 10 * t.alpha, 0, Math.PI * 2);
     ctx.fill();
+  }
+
+  // Desenha os itens colecionáveis ativos
+  for (const pu of currentState.powerups || []) {
+    drawPowerup(pu, now);
   }
 
   const extrapSeconds = Math.min(0.05, Math.max(0, (now - lastSnapshotTime) / 1000));
