@@ -1,9 +1,13 @@
 'use strict';
 
-// O cliente desenha snapshots do servidor; nunca altera posições ou decide colisões.
-const socket = io();
+// Cliente com Predição Local (zero delay nas teclas) e Interpolação Suave.
+const socket = io({
+  transports: ['websocket'],
+  upgrade: false
+});
+
 const canvas = document.getElementById('gameCanvas');
-const ctx = canvas.getContext('2d');
+const ctx = canvas.getContext('2d', { alpha: false });
 const joinOverlay = document.getElementById('joinOverlay');
 const joinForm = document.getElementById('joinForm');
 const nicknameInput = document.getElementById('nicknameInput');
@@ -31,6 +35,9 @@ const ASSETS = {
     pulse: '/assets/ship-pulse.png'
   }
 };
+
+// Ajuste este valor para ficar igual à velocidade do jogador no server.js (ex: 260, 280 ou 300)
+const LOCAL_PLAYER_SPEED = 280;
 const GAME_STATES = { WAITING: 'AGUARDANDO', PLAYING: 'EM_JOGO', ROUND_OVER: 'FIM_DE_RODADA' };
 const KEY_TO_DIRECTION = {
   KeyW: 'up', ArrowUp: 'up',
@@ -48,6 +55,38 @@ for (const [name, src] of Object.entries(ASSETS.characters)) {
   characterImages[name] = image;
 }
 
+// Pré-renderiza o fundo uma única vez em um canvas auxiliar para eliminar gargalo de GPU/CPU
+const bgCanvas = document.createElement('canvas');
+bgCanvas.width = canvas.width;
+bgCanvas.height = canvas.height;
+const bgCtx = bgCanvas.getContext('2d');
+let bgCached = false;
+
+function rebuildBackgroundCache() {
+  bgCtx.fillStyle = '#090b18';
+  bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
+  if (mapImage.complete && mapImage.naturalWidth > 0) {
+    const scale = Math.max(bgCanvas.width / mapImage.naturalWidth, bgCanvas.height / mapImage.naturalHeight);
+    const sourceWidth = bgCanvas.width / scale;
+    const sourceHeight = bgCanvas.height / scale;
+    const sourceX = (mapImage.naturalWidth - sourceWidth) / 2;
+    const sourceY = (mapImage.naturalHeight - sourceHeight) / 2;
+    bgCtx.drawImage(mapImage, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, bgCanvas.width, bgCanvas.height);
+    bgCached = true;
+  }
+  const shade = bgCtx.createLinearGradient(0, 0, 0, bgCanvas.height);
+  shade.addColorStop(0, 'rgba(5, 8, 22, .26)');
+  shade.addColorStop(1, 'rgba(5, 7, 18, .49)');
+  bgCtx.fillStyle = shade;
+  bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
+  bgCtx.strokeStyle = 'rgba(168, 186, 255, .16)';
+  bgCtx.lineWidth = 2;
+  bgCtx.strokeRect(1, 1, bgCanvas.width - 2, bgCanvas.height - 2);
+}
+
+mapImage.onload = rebuildBackgroundCache;
+rebuildBackgroundCache();
+
 let myPlayerId = null;
 let hasJoined = false;
 let hasEnteredSession = false;
@@ -62,10 +101,18 @@ let currentState = {
   elapsedSeconds: 0,
   winner: null
 };
+
+// Estado local predito para eliminar atraso de teclado e engasgos de rede
+let predictedSelf = null;
+const visualPlayers = new Map();
+const meteorShapes = new Map();
+
 let feedTimer = null;
 let hudUpdateScheduled = false;
 const heldKeys = new Set();
 let lastInputSignature = '';
+let lastFrameTime = performance.now();
+let lastSnapshotTime = performance.now();
 
 function showEvent(message, isError = false) {
   eventFeed.textContent = message;
@@ -82,19 +129,21 @@ function updateConnection(state, label) {
 }
 
 function currentInput() {
-  const active = new Set([...heldKeys].map((code) => KEY_TO_DIRECTION[code]).filter(Boolean));
-  return {
-    up: active.has('up'),
-    down: active.has('down'),
-    left: active.has('left'),
-    right: active.has('right')
-  };
+  let up = false, down = false, left = false, right = false;
+  for (const code of heldKeys) {
+    const dir = KEY_TO_DIRECTION[code];
+    if (dir === 'up') up = true;
+    else if (dir === 'down') down = true;
+    else if (dir === 'left') left = true;
+    else if (dir === 'right') right = true;
+  }
+  return { up, down, left, right };
 }
 
 function sendInput(force = false) {
   if (!hasJoined || !socket.connected) return;
   const input = currentInput();
-  const signature = JSON.stringify(input);
+  const signature = `${input.up ? 1 : 0}${input.down ? 1 : 0}${input.left ? 1 : 0}${input.right ? 1 : 0}`;
   if (force || signature !== lastInputSignature) {
     socket.emit('playerInput', input);
     lastInputSignature = signature;
@@ -129,15 +178,18 @@ joinForm.addEventListener('submit', (event) => {
 window.addEventListener('keydown', (event) => {
   if (!hasJoined || !KEY_TO_DIRECTION[event.code]) return;
   event.preventDefault();
-  const before = heldKeys.size;
-  heldKeys.add(event.code);
-  if (heldKeys.size !== before) sendInput();
+  if (!event.repeat && !heldKeys.has(event.code)) {
+    heldKeys.add(event.code);
+    sendInput();
+  }
 });
 
 window.addEventListener('keyup', (event) => {
   if (!KEY_TO_DIRECTION[event.code]) return;
   event.preventDefault();
-  if (heldKeys.delete(event.code)) sendInput();
+  if (heldKeys.delete(event.code)) {
+    sendInput();
+  }
 });
 
 window.addEventListener('blur', () => {
@@ -146,9 +198,6 @@ window.addEventListener('blur', () => {
     sendInput(true);
   }
 });
-
-// Um heartbeat modesto também recupera o estado se um pacote de input se perder.
-setInterval(() => sendInput(true), 100);
 
 socket.on('connect', () => {
   updateConnection('connected', 'Conectado');
@@ -159,6 +208,7 @@ socket.on('disconnect', () => {
   updateConnection('disconnected', 'Reconectando...');
   hasJoined = false;
   joinPending = false;
+  predictedSelf = null;
   heldKeys.clear();
   lastInputSignature = '';
   joinButton.disabled = false;
@@ -188,6 +238,13 @@ socket.on('initState', (payload) => {
   hasJoined = true;
   joinPending = false;
   currentState = payload;
+  lastSnapshotTime = performance.now();
+
+  const me = payload.players && payload.players[myPlayerId];
+  if (me) {
+    predictedSelf = { x: me.x, y: me.y };
+  }
+
   joinOverlay.classList.add('hidden');
   joinButton.disabled = false;
   joinButton.querySelector('span').textContent = 'LANÇAR NAVE';
@@ -198,6 +255,29 @@ socket.on('initState', (payload) => {
 
 socket.on('gameState', (snapshot) => {
   currentState = snapshot;
+  lastSnapshotTime = performance.now();
+
+  // Reconciliação suave com a posição autoritativa do servidor
+  const serverMe = snapshot.players && snapshot.players[myPlayerId];
+  if (serverMe) {
+    if (!predictedSelf || snapshot.gameState !== GAME_STATES.PLAYING) {
+      predictedSelf = { x: serverMe.x, y: serverMe.y };
+    } else {
+      const dx = serverMe.x - predictedSelf.x;
+      const dy = serverMe.y - predictedSelf.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist > 95) {
+        // Teleporte ou início de rodada: sincroniza imediatamente
+        predictedSelf.x = serverMe.x;
+        predictedSelf.y = serverMe.y;
+      } else if (dist > 2) {
+        // Correção gradual sem trancos na tela
+        predictedSelf.x += dx * 0.18;
+        predictedSelf.y += dy * 0.18;
+      }
+    }
+  }
+
   scheduleHudUpdate();
 });
 
@@ -206,6 +286,7 @@ socket.on('playerJoined', (player) => {
 });
 
 socket.on('playerLeft', (player) => {
+  visualPlayers.delete(player.id);
   showEvent(`${player.nickname} deixou a arena.`);
 });
 
@@ -221,18 +302,18 @@ function formatSeconds(seconds) {
   return `${Math.max(0, Number(seconds) || 0).toFixed(1)}s`;
 }
 
-// Os snapshots chegam a 60 Hz; a tabela DOM só precisa ser reconstruída a 10 Hz.
+// Atualiza o DOM apenas a 4 Hz para não travar a thread de renderização
 function scheduleHudUpdate() {
   if (hudUpdateScheduled) return;
   hudUpdateScheduled = true;
   setTimeout(() => {
     hudUpdateScheduled = false;
     updateHud();
-  }, 100);
+  }, 250);
 }
 
 function setBanner(text, stateClass) {
-  bannerText.textContent = text;
+  if (bannerText.textContent !== text) bannerText.textContent = text;
   gameBanner.classList.remove('playing', 'finished');
   if (stateClass) gameBanner.classList.add(stateClass);
 }
@@ -328,152 +409,174 @@ function renderLeaderboard(players) {
   }
 }
 
-function drawBackground() {
-  ctx.fillStyle = '#090b18';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  if (mapImage.complete && mapImage.naturalWidth > 0) {
-    // Mantém a proporção do fundo e recorta o centro para preencher a arena 4:3.
-    const scale = Math.max(canvas.width / mapImage.naturalWidth, canvas.height / mapImage.naturalHeight);
-    const sourceWidth = canvas.width / scale;
-    const sourceHeight = canvas.height / scale;
-    const sourceX = (mapImage.naturalWidth - sourceWidth) / 2;
-    const sourceY = (mapImage.naturalHeight - sourceHeight) / 2;
-    ctx.drawImage(mapImage, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
-  }
-  const shade = ctx.createLinearGradient(0, 0, 0, canvas.height);
-  shade.addColorStop(0, 'rgba(5, 8, 22, .26)');
-  shade.addColorStop(1, 'rgba(5, 7, 18, .49)');
-  ctx.fillStyle = shade;
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.strokeStyle = 'rgba(168, 186, 255, .16)';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(1, 1, canvas.width - 2, canvas.height - 2);
-}
-
-function drawMeteor(meteor) {
-  const magnitude = Math.hypot(meteor.vx, meteor.vy) || 1;
-  const trailLength = meteor.radius * 3.7;
-  const tailX = meteor.x - (meteor.vx / magnitude) * trailLength;
-  const tailY = meteor.y - (meteor.vy / magnitude) * trailLength;
-  ctx.save();
-  ctx.lineCap = 'round';
-  const trail = ctx.createLinearGradient(tailX, tailY, meteor.x, meteor.y);
-  trail.addColorStop(0, 'rgba(255, 85, 44, 0)');
-  trail.addColorStop(.58, 'rgba(255, 117, 56, .16)');
-  trail.addColorStop(1, 'rgba(255, 214, 145, .82)');
-  ctx.strokeStyle = trail;
-  ctx.lineWidth = Math.max(5, meteor.radius * .68);
-  ctx.beginPath();
-  ctx.moveTo(tailX, tailY);
-  ctx.lineTo(meteor.x, meteor.y);
-  ctx.stroke();
-
-  const glow = ctx.createRadialGradient(meteor.x, meteor.y, 1, meteor.x, meteor.y, meteor.radius * 1.8);
-  glow.addColorStop(0, 'rgba(255, 205, 126, .34)');
-  glow.addColorStop(1, 'rgba(255, 105, 52, 0)');
-  ctx.fillStyle = glow;
-  ctx.beginPath();
-  ctx.arc(meteor.x, meteor.y, meteor.radius * 1.8, 0, Math.PI * 2);
-  ctx.fill();
-
-  const seed = Number(meteor.id) || 1;
-  const points = 10;
-  const angles = [];
-  for (let i = 0; i < points; i += 1) {
-    const angle = (i / points) * Math.PI * 2;
-    const jitter = .76 + seededRandom(seed * 13 + i) * .3;
-    angles.push([Math.cos(angle) * meteor.radius * jitter, Math.sin(angle) * meteor.radius * jitter]);
-  }
-  const rock = ctx.createRadialGradient(meteor.x - meteor.radius * .35, meteor.y - meteor.radius * .45, 1, meteor.x, meteor.y, meteor.radius * 1.2);
-  rock.addColorStop(0, '#ffca85');
-  rock.addColorStop(.33, '#d36b45');
-  rock.addColorStop(1, '#553b4a');
-  ctx.beginPath();
-  angles.forEach(([dx, dy], index) => {
-    if (index === 0) ctx.moveTo(meteor.x + dx, meteor.y + dy);
-    else ctx.lineTo(meteor.x + dx, meteor.y + dy);
-  });
-  ctx.closePath();
-  ctx.fillStyle = rock;
-  ctx.fill();
-  ctx.strokeStyle = 'rgba(255, 195, 130, .65)';
-  ctx.lineWidth = 1.4;
-  ctx.stroke();
-
-  ctx.fillStyle = 'rgba(77, 43, 48, .62)';
-  ctx.beginPath();
-  ctx.arc(meteor.x + meteor.radius * .23, meteor.y - meteor.radius * .16, meteor.radius * .18, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.beginPath();
-  ctx.arc(meteor.x - meteor.radius * .28, meteor.y + meteor.radius * .24, meteor.radius * .1, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.restore();
-}
-
 function seededRandom(seed) {
   const value = Math.sin(seed * 78.233) * 43758.5453;
   return value - Math.floor(value);
 }
 
-function drawPlayer(player) {
+// Cacheia a geometria do meteoro para não recalcular seno/cosseno a cada quadro
+function getMeteorOffsets(meteor) {
+  const key = `${meteor.id}_${meteor.radius}`;
+  let offsets = meteorShapes.get(key);
+  if (!offsets) {
+    const seed = Number(meteor.id) || 1;
+    const points = 10;
+    offsets = [];
+    for (let i = 0; i < points; i += 1) {
+      const angle = (i / points) * Math.PI * 2;
+      const jitter = 0.76 + seededRandom(seed * 13 + i) * 0.3;
+      offsets.push([Math.cos(angle) * meteor.radius * jitter, Math.sin(angle) * meteor.radius * jitter]);
+    }
+    if (meteorShapes.size > 200) meteorShapes.clear();
+    meteorShapes.set(key, offsets);
+  }
+  return offsets;
+}
+
+function drawMeteor(meteor, extrapSeconds) {
+  // Extrapola a posição do meteoro usando sua velocidade para fluidez a 60/144 FPS
+  const x = meteor.x + (meteor.vx || 0) * extrapSeconds;
+  const y = meteor.y + (meteor.vy || 0) * extrapSeconds;
+
+  const magnitude = Math.hypot(meteor.vx, meteor.vy) || 1;
+  const trailLength = meteor.radius * 3.5;
+  const tailX = x - (meteor.vx / magnitude) * trailLength;
+  const tailY = y - (meteor.vy / magnitude) * trailLength;
+
+  ctx.save();
+  ctx.lineCap = 'round';
+  const trail = ctx.createLinearGradient(tailX, tailY, x, y);
+  trail.addColorStop(0, 'rgba(255, 85, 44, 0)');
+  trail.addColorStop(0.58, 'rgba(255, 117, 56, .22)');
+  trail.addColorStop(1, 'rgba(255, 214, 145, .85)');
+  ctx.strokeStyle = trail;
+  ctx.lineWidth = Math.max(5, meteor.radius * 0.68);
+  ctx.beginPath();
+  ctx.moveTo(tailX, tailY);
+  ctx.lineTo(x, y);
+  ctx.stroke();
+
+  const offsets = getMeteorOffsets(meteor);
+  ctx.beginPath();
+  for (let i = 0; i < offsets.length; i += 1) {
+    const [dx, dy] = offsets[i];
+    if (i === 0) ctx.moveTo(x + dx, y + dy);
+    else ctx.lineTo(x + dx, y + dy);
+  }
+  ctx.closePath();
+  ctx.fillStyle = '#c95d38';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255, 200, 140, .75)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  ctx.fillStyle = 'rgba(77, 43, 48, .62)';
+  ctx.beginPath();
+  ctx.arc(x + meteor.radius * 0.23, y - meteor.radius * 0.16, meteor.radius * 0.18, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawPlayer(player, renderX, renderY) {
   const ghost = player.alive !== true;
   const radius = player.radius || 20;
   const sprite = characterImages[player.character] || characterImages.nova;
   ctx.save();
-  if (ghost) ctx.globalAlpha = .35;
-
-  // Halo colorido para distinguir pilotos que usam o mesmo modelo de nave.
-  const halo = ctx.createRadialGradient(player.x, player.y, radius * .3, player.x, player.y, radius * 1.8);
-  halo.addColorStop(0, 'rgba(96, 210, 255, .13)');
-  halo.addColorStop(1, 'rgba(96, 210, 255, 0)');
-  ctx.fillStyle = halo;
-  ctx.beginPath();
-  ctx.arc(player.x, player.y, radius * 1.8, 0, Math.PI * 2);
-  ctx.fill();
+  if (ghost) ctx.globalAlpha = 0.35;
 
   ctx.strokeStyle = player.color || '#63e4ff';
   ctx.lineWidth = 2;
   ctx.beginPath();
-  ctx.arc(player.x, player.y, radius + 2, 0, Math.PI * 2);
+  ctx.arc(renderX, renderY, radius + 2, 0, Math.PI * 2);
   ctx.stroke();
+
   if (player.id === myPlayerId) {
     ctx.setLineDash([3, 4]);
     ctx.strokeStyle = 'rgba(255, 255, 255, .85)';
     ctx.beginPath();
-    ctx.arc(player.x, player.y, radius + 6, 0, Math.PI * 2);
+    ctx.arc(renderX, renderY, radius + 6, 0, Math.PI * 2);
     ctx.stroke();
     ctx.setLineDash([]);
   }
 
   if (sprite.complete && sprite.naturalWidth > 0) {
     const size = radius * 2.25;
-    ctx.drawImage(sprite, player.x - size / 2, player.y - size / 2, size, size);
+    ctx.drawImage(sprite, renderX - size / 2, renderY - size / 2, size, size);
   } else {
     ctx.fillStyle = player.color || '#63e4ff';
     ctx.beginPath();
-    ctx.arc(player.x, player.y, radius * .72, 0, Math.PI * 2);
+    ctx.arc(renderX, renderY, radius * 0.72, 0, Math.PI * 2);
     ctx.fill();
   }
 
   const label = ghost ? `${player.nickname} [Fantasma]` : player.nickname;
-  const labelY = player.y - radius - 10;
+  const labelY = renderY - radius - 10;
   ctx.font = '700 12px Inter, system-ui, sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'bottom';
   ctx.lineJoin = 'round';
-  ctx.lineWidth = 4;
+  ctx.lineWidth = 3;
   ctx.strokeStyle = 'rgba(4, 7, 18, .92)';
-  ctx.strokeText(label, player.x, labelY);
+  ctx.strokeText(label, renderX, labelY);
   ctx.fillStyle = player.id === myPlayerId ? '#ffffff' : '#e8edff';
-  ctx.fillText(label, player.x, labelY);
+  ctx.fillText(label, renderX, labelY);
   ctx.restore();
 }
 
-function render() {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  drawBackground();
-  for (const meteor of currentState.meteors || []) drawMeteor(meteor);
-  for (const player of Object.values(currentState.players || {})) drawPlayer(player);
+function stepLocalPrediction(dt) {
+  if (!hasJoined || !myPlayerId || !predictedSelf) return;
+  const me = currentState.players && currentState.players[myPlayerId];
+  if (!me || currentState.gameState !== GAME_STATES.PLAYING) return;
+
+  const input = currentInput();
+  let vx = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+  let vy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+
+  if (vx !== 0 || vy !== 0) {
+    const len = Math.hypot(vx, vy);
+    vx = (vx / len) * LOCAL_PLAYER_SPEED;
+    vy = (vy / len) * LOCAL_PLAYER_SPEED;
+    const r = me.radius || 20;
+    predictedSelf.x = Math.max(r, Math.min(canvas.width - r, predictedSelf.x + vx * dt));
+    predictedSelf.y = Math.max(r, Math.min(canvas.height - r, predictedSelf.y + vy * dt));
+  }
+}
+
+function render(now) {
+  const dt = Math.min(0.05, (now - lastFrameTime) / 1000);
+  lastFrameTime = now;
+
+  if (!bgCached && mapImage.complete && mapImage.naturalWidth > 0) {
+    rebuildBackgroundCache();
+  }
+
+  stepLocalPrediction(dt);
+
+  // Desenha o fundo pré-renderizado (muito mais leve)
+  ctx.drawImage(bgCanvas, 0, 0);
+
+  // Extrapolação limitada a 50 ms para evitar que meteoros atravessem a nave visualmente
+  const extrapSeconds = Math.min(0.05, Math.max(0, (now - lastSnapshotTime) / 1000));
+  for (const meteor of currentState.meteors || []) {
+    drawMeteor(meteor, extrapSeconds);
+  }
+
+  for (const player of Object.values(currentState.players || {})) {
+    if (player.id === myPlayerId && predictedSelf && currentState.gameState === GAME_STATES.PLAYING) {
+      drawPlayer(player, predictedSelf.x, predictedSelf.y);
+    } else {
+      let vis = visualPlayers.get(player.id);
+      if (!vis) {
+        vis = { x: player.x, y: player.y };
+        visualPlayers.set(player.id, vis);
+      } else {
+        vis.x += (player.x - vis.x) * 0.35;
+        vis.y += (player.y - vis.y) * 0.35;
+      }
+      drawPlayer(player, vis.x, vis.y);
+    }
+  }
+
   requestAnimationFrame(render);
 }
 
