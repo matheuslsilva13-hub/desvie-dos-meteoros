@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#080b18" />
+  <meta name="description" content="Sobreviva à chuva de meteoros nesta arena multiplayer em tempo real." />
+  <title>Desvie dos Meteoros — Arena Multiplayer</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="top-bar">
+      <a class="brand" href="/" aria-label="Desvie dos Meteoros, início">
+        <span class="brand-mark" aria-hidden="true"><i></i><b></b></span>
+        <span class="brand-copy">
+          <strong>DESVIE DOS METEOROS</strong>
+          <small>ARENA DE SOBREVIVÊNCIA · MULTIPLAYER</small>
+        </span>
+      </a>
+      <div id="connectionStatus" class="connection-pill" aria-live="polite">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="statusText">Conectando...</span>
+      </div>
+    </header>
+
+    <main class="arena-layout">
+      <section class="game-column" aria-label="Arena do jogo">
+        <div class="canvas-frame">
+          <div id="gameBanner" class="game-banner" role="status" aria-live="polite">
+            <span class="banner-led" aria-hidden="true"></span>
+            <span id="bannerText">Aguardando jogadores...</span>
+          </div>
+          <canvas id="gameCanvas" width="800" height="600" aria-label="Arena 2D de sobrevivência a meteoros">
+            Seu navegador não suporta Canvas. Atualize-o para jogar.
+          </canvas>
+          <div class="canvas-vignette" aria-hidden="true"></div>
+        </div>
+        <div class="arena-caption">
+          <span><i class="caption-dot cyan"></i> Arena <strong>800 × 600</strong></span>
+          <span><i class="caption-dot orange"></i> Desvie dos rastros incandescentes</span>
+        </div>
+      </section>
+
+      <aside class="hud-panel" aria-label="Painel da partida">
+        <section class="panel-section status-card">
+          <div class="section-heading">
+            <span class="eyebrow">STATUS DA PARTIDA</span>
+            <span id="roundNumber" class="round-chip">RODADA 0</span>
+          </div>
+          <div class="status-main">
+            <span id="roundStatusDot" class="round-status-dot waiting" aria-hidden="true"></span>
+            <div>
+              <strong id="roundStatus">Sala de espera</strong>
+              <small id="roundHint">A partida começa com 2 pilotos</small>
+            </div>
+          </div>
+          <div class="status-metrics">
+            <div><span>NA ARENA</span><strong id="playerCount">0</strong></div>
+            <div><span>METEOROS</span><strong id="meteorCount">0</strong></div>
+          </div>
+        </section>
+
+        <section class="panel-section scoreboard-section">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">PLACAR AO VIVO</span>
+              <h2>Pilotos</h2>
+            </div>
+            <span id="aliveCount" class="alive-chip">0 vivos</span>
+          </div>
+          <div class="table-wrap">
+            <table class="scoreboard">
+              <thead>
+                <tr><th scope="col">PILOTO</th><th scope="col">STATUS</th><th scope="col">TEMPO</th><th scope="col">VIT.</th></tr>
+              </thead>
+              <tbody id="leaderboard">
+                <tr><td colspan="4" class="empty-state">Aguardando pilotos...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel-section controls-card">
+          <span class="eyebrow">CONTROLES</span>
+          <div class="control-row">
+            <div class="key-cluster" aria-label="W, A, S e D">
+              <kbd>W</kbd><span><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></span>
+            </div>
+            <span>ou setas direcionais</span>
+          </div>
+          <p>Movimento diagonal normalizado. Pilotos eliminados continuam assistindo como fantasmas.</p>
+        </section>
+        <div id="eventFeed" class="event-feed" aria-live="polite"></div>
+      </aside>
+    </main>
+    <footer class="page-footer">
+      <span>O servidor valida cada movimento e decide todas as colisões.</span>
+      <span class="footer-separator">·</span>
+      <span>Não deixe nenhum piloto para trás.</span>
+    </footer>
+  </div>
+
+  <div id="joinOverlay" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-card">
+      <div class="modal-kicker"><span class="kicker-star">✦</span> SINAL DE LANÇAMENTO DETECTADO</div>
+      <h1 id="modalTitle">Entre na <span>órbita.</span></h1>
+      <p class="modal-subtitle">Escolha seu codinome e nave. A próxima chuva de meteoros está a caminho.</p>
+      <form id="joinForm" novalidate>
+        <label class="field-label" for="nicknameInput">CODINOME DO PILOTO</label>
+        <div class="input-wrap">
+          <span class="input-prefix" aria-hidden="true">&gt;</span>
+          <input id="nicknameInput" name="nickname" type="text" maxlength="16" autocomplete="nickname" placeholder="Ex.: CometaAzul" aria-describedby="formError nicknameHelp" required />
+        </div>
+        <small id="nicknameHelp" class="field-help">1 a 16 caracteres</small>
+        <div class="field-label character-label">ESCOLHA SUA NAVE</div>
+        <div class="character-grid" role="radiogroup" aria-label="Seleção de nave">
+          <label class="character-option">
+            <input type="radio" name="character" value="nova" checked />
+            <span class="character-card"><span class="ship-preview"><img src="/assets/ship-nova.png" alt="" /></span><strong>NOVA</strong><small>Exploradora</small></span>
+          </label>
+          <label class="character-option">
+            <input type="radio" name="character" value="comet" />
+            <span class="character-card"><span class="ship-preview"><img src="/assets/ship-comet.png" alt="" /></span><strong>COMET</strong><small>Intercepção</small></span>
+          </label>
+          <label class="character-option">
+            <input type="radio" name="character" value="pulse" />
+            <span class="character-card"><span class="ship-preview"><img src="/assets/ship-pulse.png" alt="" /></span><strong>PULSE</strong><small>Resgate</small></span>
+          </label>
+        </div>
+        <p id="formError" class="form-error" role="alert"></p>
+        <button id="joinButton" class="btn-launch" type="submit"><span>LANÇAR NAVE</span><b aria-hidden="true">↗</b></button>
+      </form>
+      <div class="modal-footnote"><span class="footnote-dot"></span> Conecte pelo menos 2 pilotos para iniciar a rodada</div>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/client.js" defer></script>
+</body>
+</html>
