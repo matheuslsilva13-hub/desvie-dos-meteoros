@@ -1,6 +1,5 @@
 'use strict';
 
-// Cliente com Predição Local (zero delay nas teclas) e Interpolação Suave.
 const socket = io({
   transports: ['websocket'],
   upgrade: false
@@ -36,8 +35,11 @@ const ASSETS = {
   }
 };
 
-// Velocidade padrão em pixels/segundo (será sobrescrita se o server.js enviar playerSpeed no initState)
-let localPlayerSpeed = 240;
+// Valores sincronizados automaticamente com o server.js
+let playerSpeed = 290;
+let dashSpeed = 680;
+let dashDuration = 0.16;
+let dashCooldownMax = 2.4;
 
 const GAME_STATES = { WAITING: 'AGUARDANDO', PLAYING: 'EM_JOGO', ROUND_OVER: 'FIM_DE_RODADA' };
 const KEY_TO_DIRECTION = {
@@ -46,6 +48,7 @@ const KEY_TO_DIRECTION = {
   KeyA: 'left', ArrowLeft: 'left',
   KeyD: 'right', ArrowRight: 'right'
 };
+const DASH_KEYS = new Set(['Space', 'ShiftLeft', 'ShiftRight']);
 
 const mapImage = new Image();
 mapImage.src = ASSETS.map;
@@ -56,7 +59,33 @@ for (const [name, src] of Object.entries(ASSETS.characters)) {
   characterImages[name] = image;
 }
 
-// Pré-renderiza o fundo uma única vez em um canvas auxiliar
+// Sintetizador leve de efeitos sonoros (sem arquivos externos)
+let audioCtx = null;
+function playTone(freq, endFreq, duration, type = 'sine', volume = 0.08) {
+  try {
+    if (!audioCtx) {
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      if (AudioContext) audioCtx = new AudioContext();
+    }
+    if (!audioCtx) return;
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(Math.max(20, endFreq), audioCtx.currentTime + duration);
+    gain.gain.setValueAtTime(volume, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+  } catch (_e) {
+    // Ignora bloqueio de áudio automático
+  }
+}
+
+// Pré-renderiza o fundo uma única vez
 const bgCanvas = document.createElement('canvas');
 bgCanvas.width = canvas.width;
 bgCanvas.height = canvas.height;
@@ -103,10 +132,18 @@ let currentState = {
   winner: null
 };
 
-// Estado local predito para eliminar atraso de teclado e engasgos de rede
+// Estado local predito para resposta instantânea
 let predictedSelf = null;
+let localDashTimer = 0;
+let localDashCooldown = 0;
+let localDashDir = { x: 0, y: -1 };
+let lastMoveDir = { x: 0, y: -1 };
 const visualPlayers = new Map();
 const meteorShapes = new Map();
+const dashTrails = [];
+
+// Controle Touch para celular
+let touchTarget = null;
 
 let feedTimer = null;
 let hudUpdateScheduled = false;
@@ -138,6 +175,21 @@ function currentInput() {
     else if (dir === 'left') left = true;
     else if (dir === 'right') right = true;
   }
+
+  // Suporte ao toque na tela (celular/tablet)
+  if (touchTarget && predictedSelf) {
+    const dx = touchTarget.x - predictedSelf.x;
+    const dy = touchTarget.y - predictedSelf.y;
+    if (Math.abs(dx) > 10) {
+      if (dx < 0) left = true;
+      else right = true;
+    }
+    if (Math.abs(dy) > 10) {
+      if (dy < 0) up = true;
+      else down = true;
+    }
+  }
+
   return { up, down, left, right };
 }
 
@@ -149,6 +201,28 @@ function sendInput(force = false) {
     socket.emit('playerInput', input);
     lastInputSignature = signature;
   }
+}
+
+function triggerLocalDash() {
+  if (!hasJoined || !predictedSelf || currentState.gameState !== GAME_STATES.PLAYING) return;
+  const me = currentState.players && currentState.players[myPlayerId];
+  if (!me || !me.alive) return;
+  if (localDashCooldown > 0 || localDashTimer > 0) return;
+
+  const input = currentInput();
+  let dx = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+  let dy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+  if (dx === 0 && dy === 0) {
+    dx = lastMoveDir.x;
+    dy = lastMoveDir.y;
+  }
+  const len = Math.hypot(dx, dy) || 1;
+  localDashDir = { x: dx / len, y: dy / len };
+  localDashTimer = dashDuration;
+  localDashCooldown = dashCooldownMax;
+
+  socket.emit('playerDash');
+  playTone(260, 740, 0.14, 'triangle', 0.1);
 }
 
 function emitJoin() {
@@ -177,7 +251,13 @@ joinForm.addEventListener('submit', (event) => {
 });
 
 window.addEventListener('keydown', (event) => {
-  if (!hasJoined || !KEY_TO_DIRECTION[event.code]) return;
+  if (!hasJoined) return;
+  if (DASH_KEYS.has(event.code)) {
+    event.preventDefault();
+    if (!event.repeat) triggerLocalDash();
+    return;
+  }
+  if (!KEY_TO_DIRECTION[event.code]) return;
   event.preventDefault();
   if (!event.repeat && !heldKeys.has(event.code)) {
     heldKeys.add(event.code);
@@ -194,10 +274,44 @@ window.addEventListener('keyup', (event) => {
 });
 
 window.addEventListener('blur', () => {
-  if (heldKeys.size > 0) {
+  if (heldKeys.size > 0 || touchTarget) {
     heldKeys.clear();
+    touchTarget = null;
     sendInput(true);
   }
+});
+
+// Eventos Touch no Canvas (para pilotar no celular)
+function updateTouchCoords(touch) {
+  const rect = canvas.getBoundingClientRect();
+  touchTarget = {
+    x: ((touch.clientX - rect.left) / rect.width) * canvas.width,
+    y: ((touch.clientY - rect.top) / rect.height) * canvas.height
+  };
+  sendInput();
+}
+
+let lastTapTime = 0;
+canvas.addEventListener('touchstart', (e) => {
+  if (!hasJoined) return;
+  e.preventDefault();
+  const now = performance.now();
+  if (now - lastTapTime < 260) {
+    triggerLocalDash();
+  }
+  lastTapTime = now;
+  if (e.touches[0]) updateTouchCoords(e.touches[0]);
+}, { passive: false });
+
+canvas.addEventListener('touchmove', (e) => {
+  if (!hasJoined) return;
+  e.preventDefault();
+  if (e.touches[0]) updateTouchCoords(e.touches[0]);
+}, { passive: false });
+
+canvas.addEventListener('touchend', () => {
+  touchTarget = null;
+  sendInput(true);
 });
 
 socket.on('connect', () => {
@@ -211,6 +325,7 @@ socket.on('disconnect', () => {
   joinPending = false;
   predictedSelf = null;
   heldKeys.clear();
+  touchTarget = null;
   lastInputSignature = '';
   joinButton.disabled = false;
   joinButton.querySelector('span').textContent = 'LANÇAR NAVE';
@@ -241,15 +356,13 @@ socket.on('initState', (payload) => {
   currentState = payload;
   lastSnapshotTime = performance.now();
 
-  if (typeof payload.playerSpeed === 'number' && payload.playerSpeed > 0) {
-    localPlayerSpeed = payload.playerSpeed;
-  }
+  if (typeof payload.playerSpeed === 'number') playerSpeed = payload.playerSpeed;
+  if (typeof payload.dashSpeed === 'number') dashSpeed = payload.dashSpeed;
+  if (typeof payload.dashDuration === 'number') dashDuration = payload.dashDuration;
+  if (typeof payload.dashCooldownMax === 'number') dashCooldownMax = payload.dashCooldownMax;
 
   const me = payload.players && payload.players[myPlayerId];
   if (me) {
-    if (typeof me.speed === 'number' && me.speed > 0) {
-      localPlayerSpeed = me.speed;
-    }
     predictedSelf = { x: me.x, y: me.y };
   }
 
@@ -259,30 +372,30 @@ socket.on('initState', (payload) => {
   lastInputSignature = '';
   sendInput(true);
   updateHud();
+  showEvent('Controles: WASD/Setas para mover | ESPAÇO para Dash!');
 });
 
 socket.on('gameState', (snapshot) => {
+  const prevState = currentState.gameState;
   currentState = snapshot;
   lastSnapshotTime = performance.now();
 
-  // Reconciliação suave com margem de tolerância para evitar puxões por latência
+  if (typeof snapshot.playerSpeed === 'number') playerSpeed = snapshot.playerSpeed;
+
   const serverMe = snapshot.players && snapshot.players[myPlayerId];
   if (serverMe) {
-    if (typeof serverMe.speed === 'number' && serverMe.speed > 0) {
-      localPlayerSpeed = serverMe.speed;
-    }
-    if (!predictedSelf || snapshot.gameState !== GAME_STATES.PLAYING) {
+    if (!predictedSelf || prevState !== snapshot.gameState) {
       predictedSelf = { x: serverMe.x, y: serverMe.y };
+      localDashTimer = 0;
+      localDashCooldown = 0;
     } else {
       const dx = serverMe.x - predictedSelf.x;
       const dy = serverMe.y - predictedSelf.y;
       const dist = Math.hypot(dx, dy);
-      if (dist > 110) {
-        // Teleporte ou início de rodada: sincroniza imediatamente
+      if (dist > 120) {
         predictedSelf.x = serverMe.x;
         predictedSelf.y = serverMe.y;
-      } else if (dist > 10) {
-        // Correção gradual apenas quando a divergência ultrapassar a margem de latência
+      } else if (dist > 12 && localDashTimer <= 0) {
         predictedSelf.x += dx * 0.08;
         predictedSelf.y += dy * 0.08;
       }
@@ -290,6 +403,11 @@ socket.on('gameState', (snapshot) => {
   }
 
   scheduleHudUpdate();
+});
+
+socket.on('shieldBroken', () => {
+  playTone(480, 140, 0.25, 'sawtooth', 0.12);
+  showEvent('Escudo destruído! Cuidado com o próximo impacto!', true);
 });
 
 socket.on('playerJoined', (player) => {
@@ -302,18 +420,21 @@ socket.on('playerLeft', (player) => {
 });
 
 socket.on('playerEliminated', (player) => {
-  showEvent(`${player.nickname} foi atingido e agora observa como fantasma.`);
+  if (player.id === myPlayerId) {
+    playTone(180, 45, 0.45, 'sawtooth', 0.14);
+  }
+  showEvent(`${player.nickname} foi atingido!`);
 });
 
 socket.on('roundEnded', ({ winner }) => {
-  showEvent(winner ? `${winner.nickname} venceu a rodada!` : 'A rodada terminou sem sobreviventes.');
+  playTone(440, 660, 0.3, 'triangle', 0.1);
+  showEvent(winner ? `${winner.nickname} venceu a rodada!` : 'Fim de rodada!');
 });
 
 function formatSeconds(seconds) {
   return `${Math.max(0, Number(seconds) || 0).toFixed(1)}s`;
 }
 
-// Atualiza o DOM apenas a 4 Hz para não travar a thread de renderização
 function scheduleHudUpdate() {
   if (hudUpdateScheduled) return;
   hudUpdateScheduled = true;
@@ -341,26 +462,26 @@ function updateHud() {
     case GAME_STATES.PLAYING:
       setBanner(`Tempo: ${currentState.elapsedSeconds || 0}s`, 'playing');
       roundStatus.textContent = 'Desvie dos meteoros';
-      roundHint.textContent = `${alive} piloto${alive === 1 ? '' : 's'} ainda sobrevive${alive === 1 ? '' : 'm'}`;
+      roundHint.textContent = 'WASD/Setas: mover • Espaço/Duplo-toque: Dash';
       roundStatusDot.className = 'round-status-dot playing';
       break;
     case GAME_STATES.ROUND_OVER: {
-      const winnerName = currentState.winner ? currentState.winner.nickname : 'Nenhum sobrevivente';
-      setBanner(`Fim de Rodada! Vencedor: ${winnerName}`, 'finished');
+      const winnerName = currentState.winner ? currentState.winner.nickname : 'Fim de treino';
+      setBanner(`Fim de Rodada! ${winnerName}`, 'finished');
       roundStatus.textContent = 'Fim de rodada';
-      roundHint.textContent = currentState.winner ? `Vencedor: ${winnerName}` : 'Todos foram atingidos';
+      roundHint.textContent = 'Nova rodada começando em instantes...';
       roundStatusDot.className = 'round-status-dot finished';
       break;
     }
     default:
       if (currentState.countdownSeconds !== null && currentState.countdownSeconds !== undefined) {
-        setBanner(`Tempo: ${currentState.countdownSeconds}s`, '');
+        setBanner(`Iniciando em ${currentState.countdownSeconds}s`, '');
         roundStatus.textContent = `Lançamento em ${currentState.countdownSeconds}s`;
         roundHint.textContent = 'Prepare-se para a chuva de meteoros';
       } else {
         setBanner('Aguardando jogadores...', '');
         roundStatus.textContent = 'Sala de espera';
-        roundHint.textContent = players.length < 2 ? 'A partida começa com 2 pilotos' : 'Preparando a próxima rodada';
+        roundHint.textContent = 'Preparando arena...';
       }
       roundStatusDot.className = 'round-status-dot';
   }
@@ -405,7 +526,7 @@ function renderLeaderboard(players) {
     const statusCell = document.createElement('td');
     const status = document.createElement('span');
     status.className = player.alive ? 'status-label' : 'status-label ghost';
-    status.textContent = player.alive ? 'Vivo' : 'Fantasma';
+    status.textContent = player.alive ? (player.shield ? 'Escudo' : 'Vivo') : 'Fantasma';
     statusCell.append(status);
 
     const timeCell = document.createElement('td');
@@ -425,7 +546,6 @@ function seededRandom(seed) {
   return value - Math.floor(value);
 }
 
-// Cacheia a geometria do meteoro para não recalcular seno/cosseno a cada quadro
 function getMeteorOffsets(meteor) {
   const key = `${meteor.id}_${meteor.radius}`;
   let offsets = meteorShapes.get(key);
@@ -445,7 +565,6 @@ function getMeteorOffsets(meteor) {
 }
 
 function drawMeteor(meteor, extrapSeconds) {
-  // Extrapola a posição do meteoro usando sua velocidade para fluidez a 60/144 FPS
   const x = meteor.x + (meteor.vx || 0) * extrapSeconds;
   const y = meteor.y + (meteor.vy || 0) * extrapSeconds;
 
@@ -490,28 +609,30 @@ function drawMeteor(meteor, extrapSeconds) {
 
 function drawPlayer(player, renderX, renderY) {
   const ghost = player.alive !== true;
-  const radius = player.radius || 20;
+  const radius = player.radius || 18;
   const sprite = characterImages[player.character] || characterImages.nova;
   ctx.save();
   if (ghost) ctx.globalAlpha = 0.35;
 
-  ctx.strokeStyle = player.color || '#63e4ff';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(renderX, renderY, radius + 2, 0, Math.PI * 2);
-  ctx.stroke();
-
-  if (player.id === myPlayerId) {
-    ctx.setLineDash([3, 4]);
-    ctx.strokeStyle = 'rgba(255, 255, 255, .85)';
+  // Aura azul do Escudo ativo
+  if (!ghost && player.shield) {
+    ctx.strokeStyle = 'rgba(99, 228, 255, 0.8)';
+    ctx.fillStyle = 'rgba(99, 228, 255, 0.12)';
+    ctx.lineWidth = 2.5;
     ctx.beginPath();
-    ctx.arc(renderX, renderY, radius + 6, 0, Math.PI * 2);
+    ctx.arc(renderX, renderY, radius + 7, 0, Math.PI * 2);
+    ctx.fill();
     ctx.stroke();
-    ctx.setLineDash([]);
+  } else {
+    ctx.strokeStyle = player.color || '#63e4ff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(renderX, renderY, radius + 2, 0, Math.PI * 2);
+    ctx.stroke();
   }
 
   if (sprite.complete && sprite.naturalWidth > 0) {
-    const size = radius * 2.25;
+    const size = radius * 2.3;
     ctx.drawImage(sprite, renderX - size / 2, renderY - size / 2, size, size);
   } else {
     ctx.fillStyle = player.color || '#63e4ff';
@@ -520,8 +641,21 @@ function drawPlayer(player, renderX, renderY) {
     ctx.fill();
   }
 
+  // Barra de recarga do Dash abaixo da nave do próprio jogador
+  if (!ghost && player.id === myPlayerId) {
+    const barW = 34;
+    const barH = 4;
+    const bx = renderX - barW / 2;
+    const by = renderY + radius + 11;
+    const ratio = 1 - Math.min(1, localDashCooldown / dashCooldownMax);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+    ctx.fillRect(bx, by, barW, barH);
+    ctx.fillStyle = ratio >= 1 ? '#34d399' : '#fbbf24';
+    ctx.fillRect(bx, by, barW * ratio, barH);
+  }
+
   const label = ghost ? `${player.nickname} [Fantasma]` : player.nickname;
-  const labelY = renderY - radius - 10;
+  const labelY = renderY - radius - 11;
   ctx.font = '700 12px Inter, system-ui, sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'bottom';
@@ -537,17 +671,34 @@ function drawPlayer(player, renderX, renderY) {
 function stepLocalPrediction(dt) {
   if (!hasJoined || !myPlayerId || !predictedSelf) return;
   const me = currentState.players && currentState.players[myPlayerId];
-  if (!me || currentState.gameState !== GAME_STATES.PLAYING) return;
+  if (!me) return;
 
-  const input = currentInput();
-  let vx = (input.right ? 1 : 0) - (input.left ? 1 : 0);
-  let vy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+  if (localDashCooldown > 0) localDashCooldown = Math.max(0, localDashCooldown - dt);
+  if (localDashTimer > 0) localDashTimer = Math.max(0, localDashTimer - dt);
+
+  let vx = 0;
+  let vy = 0;
+
+  if (localDashTimer > 0) {
+    vx = localDashDir.x * dashSpeed;
+    vy = localDashDir.y * dashSpeed;
+    dashTrails.push({ x: predictedSelf.x, y: predictedSelf.y, alpha: 0.6 });
+  } else {
+    const input = currentInput();
+    let ix = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+    let iy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+    if (ix !== 0 || iy !== 0) {
+      const len = Math.hypot(ix, iy);
+      ix /= len;
+      iy /= len;
+      lastMoveDir = { x: ix, y: iy };
+      vx = ix * playerSpeed;
+      vy = iy * playerSpeed;
+    }
+  }
 
   if (vx !== 0 || vy !== 0) {
-    const len = Math.hypot(vx, vy);
-    vx = (vx / len) * localPlayerSpeed;
-    vy = (vy / len) * localPlayerSpeed;
-    const r = me.radius || 20;
+    const r = me.radius || 18;
     predictedSelf.x = Math.max(r, Math.min(canvas.width - r, predictedSelf.x + vx * dt));
     predictedSelf.y = Math.max(r, Math.min(canvas.height - r, predictedSelf.y + vy * dt));
   }
@@ -562,18 +713,29 @@ function render(now) {
   }
 
   stepLocalPrediction(dt);
-
-  // Desenha o fundo pré-renderizado
   ctx.drawImage(bgCanvas, 0, 0);
 
-  // Extrapolação limitada a 50 ms para evitar que meteoros atravessem a nave visualmente
+  // Rastro visual do Dash
+  for (let i = dashTrails.length - 1; i >= 0; i -= 1) {
+    const t = dashTrails[i];
+    t.alpha -= dt * 2.5;
+    if (t.alpha <= 0) {
+      dashTrails.splice(i, 1);
+      continue;
+    }
+    ctx.fillStyle = `rgba(99, 228, 255, ${t.alpha})`;
+    ctx.beginPath();
+    ctx.arc(t.x, t.y, 10 * t.alpha, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
   const extrapSeconds = Math.min(0.05, Math.max(0, (now - lastSnapshotTime) / 1000));
   for (const meteor of currentState.meteors || []) {
     drawMeteor(meteor, extrapSeconds);
   }
 
   for (const player of Object.values(currentState.players || {})) {
-    if (player.id === myPlayerId && predictedSelf && currentState.gameState === GAME_STATES.PLAYING) {
+    if (player.id === myPlayerId && predictedSelf) {
       drawPlayer(player, predictedSelf.x, predictedSelf.y);
     } else {
       let vis = visualPlayers.get(player.id);
