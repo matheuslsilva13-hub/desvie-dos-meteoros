@@ -29,6 +29,12 @@ const DASH_SPEED = 680;
 const DASH_DURATION = 0.16;
 const DASH_COOLDOWN = 2.4;
 
+// Configuração dos itens colecionáveis
+const POWERUP_RADIUS = 14;
+const POWERUP_SPAWN_INTERVAL = 6.5; // segundos entre cada item
+const POWERUP_LIFETIME = 11;        // segundos antes de desaparecer
+const MAX_POWERUPS = 3;
+
 const GAME_STATES = {
   WAITING: 'AGUARDANDO',
   PLAYING: 'EM_JOGO',
@@ -55,11 +61,14 @@ let countdownSeconds = null;
 let roundOverTimer = null;
 let elapsedSeconds = 0;
 let spawnAccumulator = 0;
+let powerupTimer = 0;
 let nextMeteorId = 1;
+let nextPowerupId = 1;
 let winnerInfo = null;
 
 const players = new Map();
 let meteors = [];
+let powerups = [];
 
 function clamp(val, min, max) {
   return Math.max(min, Math.min(max, val));
@@ -71,8 +80,7 @@ function sanitizeNickname(raw) {
   return Array.from(cleaned).slice(0, 16).join('');
 }
 
-function randomSpawnPosition() {
-  const margin = 70;
+function randomSpawnPosition(margin = 70) {
   return {
     x: margin + Math.random() * (ARENA_WIDTH - margin * 2),
     y: margin + Math.random() * (ARENA_HEIGHT - margin * 2)
@@ -121,6 +129,14 @@ function buildSnapshot() {
       vx: Number(m.vx.toFixed(1)),
       vy: Number(m.vy.toFixed(1)),
       radius: m.radius
+    })),
+    powerups: powerups.map((pu) => ({
+      id: pu.id,
+      type: pu.type,
+      x: Number(pu.x.toFixed(1)),
+      y: Number(pu.y.toFixed(1)),
+      radius: pu.radius,
+      ttl: Number(pu.ttl.toFixed(1))
     }))
   };
 }
@@ -153,299 +169,4 @@ function startCountdown(seconds = 3) {
       clearTimers();
       startRound();
     }
-  }, 1000);
-}
-
-function startRound() {
-  clearTimers();
-  roundNumber += 1;
-  gameState = GAME_STATES.PLAYING;
-  elapsedSeconds = 0;
-  spawnAccumulator = 0;
-  meteors = [];
-  winnerInfo = null;
-
-  for (const p of players.values()) {
-    const pos = randomSpawnPosition();
-    p.x = pos.x;
-    p.y = pos.y;
-    p.alive = true;
-    p.shield = true;
-    p.survivalTime = 0;
-    p.dashActiveTimer = 0;
-    p.dashCooldownTimer = 0;
-    p.dashDir = { x: 0, y: -1 };
-  }
-}
-
-function endRound(winner) {
-  if (gameState !== GAME_STATES.PLAYING) return;
-  gameState = GAME_STATES.ROUND_OVER;
-  winnerInfo = winner ? { id: winner.id, nickname: winner.nickname } : null;
-  if (winner) {
-    winner.wins += 1;
-  }
-
-  io.emit('roundEnded', { winner: winnerInfo });
-
-  roundOverTimer = setTimeout(() => {
-    roundOverTimer = null;
-    if (players.size >= 1) {
-      startCountdown(3);
-    } else {
-      gameState = GAME_STATES.WAITING;
-      meteors = [];
-      winnerInfo = null;
-    }
-  }, 3500);
-}
-
-function spawnMeteor() {
-  const difficulty = Math.min(2.6, 1 + elapsedSeconds * 0.025);
-  const radius = Math.round(13 + Math.random() * 19);
-  const baseSpeed = (145 + Math.random() * 130) * difficulty;
-
-  // Escolhe uma borda externa para nascer
-  const side = Math.floor(Math.random() * 4);
-  let x = 0;
-  let y = 0;
-  if (side === 0) {
-    x = Math.random() * ARENA_WIDTH;
-    y = -radius - 10;
-  } else if (side === 1) {
-    x = ARENA_WIDTH + radius + 10;
-    y = Math.random() * ARENA_HEIGHT;
-  } else if (side === 2) {
-    x = Math.random() * ARENA_WIDTH;
-    y = ARENA_HEIGHT + radius + 10;
-  } else {
-    x = -radius - 10;
-    y = Math.random() * ARENA_HEIGHT;
-  }
-
-  // Mira próximo a um jogador vivo aleatório ou ao centro da arena
-  const aliveList = Array.from(players.values()).filter((p) => p.alive);
-  let targetX = ARENA_WIDTH * (0.2 + Math.random() * 0.6);
-  let targetY = ARENA_HEIGHT * (0.2 + Math.random() * 0.6);
-
-  if (aliveList.length > 0 && Math.random() < 0.65) {
-    const targetPlayer = aliveList[Math.floor(Math.random() * aliveList.length)];
-    targetX = targetPlayer.x + (Math.random() - 0.5) * 140;
-    targetY = targetPlayer.y + (Math.random() - 0.5) * 140;
-  }
-
-  const angle = Math.atan2(targetY - y, targetX - x);
-  meteors.push({
-    id: nextMeteorId++,
-    x,
-    y,
-    vx: Math.cos(angle) * baseSpeed,
-    vy: Math.sin(angle) * baseSpeed,
-    radius
-  });
-}
-
-function triggerDash(player) {
-  if (!player || !player.alive || gameState !== GAME_STATES.PLAYING) return;
-  if (player.dashCooldownTimer > 0 || player.dashActiveTimer > 0) return;
-
-  let dx = (player.input.right ? 1 : 0) - (player.input.left ? 1 : 0);
-  let dy = (player.input.down ? 1 : 0) - (player.input.up ? 1 : 0);
-  if (dx === 0 && dy === 0) {
-    dx = player.lastDir.x;
-    dy = player.lastDir.y;
-  }
-  const len = Math.hypot(dx, dy) || 1;
-  player.dashDir = { x: dx / len, y: dy / len };
-  player.dashActiveTimer = DASH_DURATION;
-  player.dashCooldownTimer = DASH_COOLDOWN;
-}
-
-function stepSimulation(dt) {
-  if (players.size === 0) return;
-
-  // Atualiza movimento de todos os jogadores (mesmo na sala de espera para testar mobilidade)
-  for (const p of players.values()) {
-    if (p.dashCooldownTimer > 0) p.dashCooldownTimer = Math.max(0, p.dashCooldownTimer - dt);
-    if (p.dashActiveTimer > 0) p.dashActiveTimer = Math.max(0, p.dashActiveTimer - dt);
-
-    let vx = 0;
-    let vy = 0;
-
-    if (p.dashActiveTimer > 0) {
-      vx = p.dashDir.x * DASH_SPEED;
-      vy = p.dashDir.y * DASH_SPEED;
-    } else {
-      let ix = (p.input.right ? 1 : 0) - (p.input.left ? 1 : 0);
-      let iy = (p.input.down ? 1 : 0) - (p.input.up ? 1 : 0);
-      if (ix !== 0 || iy !== 0) {
-        const len = Math.hypot(ix, iy);
-        ix /= len;
-        iy /= len;
-        p.lastDir = { x: ix, y: iy };
-        vx = ix * PLAYER_SPEED;
-        vy = iy * PLAYER_SPEED;
-      }
-    }
-
-    p.x = clamp(p.x + vx * dt, p.radius, ARENA_WIDTH - p.radius);
-    p.y = clamp(p.y + vy * dt, p.radius, ARENA_HEIGHT - p.radius);
-  }
-
-  if (gameState !== GAME_STATES.PLAYING) return;
-
-  elapsedSeconds += dt;
-  const spawnRate = Math.min(9.5, 2.2 + elapsedSeconds * 0.14);
-  spawnAccumulator += dt * spawnRate;
-  while (spawnAccumulator >= 1) {
-    spawnAccumulator -= 1;
-    spawnMeteor();
-  }
-
-  // Atualiza posição dos meteoros e remove os que saíram longe da arena
-  const margin = 120;
-  meteors = meteors.filter((m) => {
-    m.x += m.vx * dt;
-    m.y += m.vy * dt;
-    return (
-      m.x >= -margin &&
-      m.x <= ARENA_WIDTH + margin &&
-      m.y >= -margin &&
-      m.y <= ARENA_HEIGHT + margin
-    );
-  });
-
-  // Checa colisões e tempo de sobrevivência
-  const startingCount = players.size;
-  for (const p of players.values()) {
-    if (!p.alive) continue;
-    p.survivalTime += dt;
-
-    // Invulnerável durante o dash ativo
-    if (p.dashActiveTimer > 0) continue;
-
-    for (let i = meteors.length - 1; i >= 0; i -= 1) {
-      const m = meteors[i];
-      const dist = Math.hypot(p.x - m.x, p.y - m.y);
-      const hitDist = (p.radius * 0.78) + (m.radius * 0.85);
-      if (dist < hitDist) {
-        meteors.splice(i, 1);
-        if (p.shield) {
-          p.shield = false;
-          io.to(p.id).emit('shieldBroken');
-        } else {
-          p.alive = false;
-          io.emit('playerEliminated', { id: p.id, nickname: p.nickname });
-        }
-        break;
-      }
-    }
-  }
-
-  const alivePlayers = Array.from(players.values()).filter((p) => p.alive);
-  if (startingCount === 1 && alivePlayers.length === 0) {
-    endRound(null);
-  } else if (startingCount >= 2 && alivePlayers.length <= 1) {
-    endRound(alivePlayers[0] || null);
-  }
-}
-
-io.on('connection', (socket) => {
-  socket.on('joinGame', (payload = {}) => {
-    if (players.has(socket.id)) return;
-
-    const nickname = sanitizeNickname(payload.nickname);
-    if (!nickname) {
-      socket.emit('serverError', { message: 'Digite um codinome válido (1 a 16 caracteres).' });
-      return;
-    }
-
-    const character = VALID_CHARACTERS.has(payload.character) ? payload.character : 'nova';
-    const color = SHIP_COLORS[players.size % SHIP_COLORS.length];
-    const pos = randomSpawnPosition();
-
-    const player = {
-      id: socket.id,
-      nickname,
-      character,
-      color,
-      x: pos.x,
-      y: pos.y,
-      radius: PLAYER_RADIUS,
-      alive: gameState === GAME_STATES.WAITING,
-      shield: true,
-      survivalTime: 0,
-      wins: 0,
-      input: { up: false, down: false, left: false, right: false },
-      lastDir: { x: 0, y: -1 },
-      dashActiveTimer: 0,
-      dashCooldownTimer: 0,
-      dashDir: { x: 0, y: -1 }
-    };
-
-    players.set(socket.id, player);
-
-    socket.emit('initState', {
-      playerId: socket.id,
-      ...buildSnapshot()
-    });
-
-    socket.broadcast.emit('playerJoined', {
-      id: player.id,
-      nickname: player.nickname
-    });
-
-    // Inicia automaticamente mesmo com 1 jogador (Modo Solo) ou mais
-    if (gameState === GAME_STATES.WAITING && !countdownTimer) {
-      startCountdown(3);
-    }
-  });
-
-  socket.on('playerInput', (input = {}) => {
-    const p = players.get(socket.id);
-    if (!p) return;
-    p.input = {
-      up: Boolean(input.up),
-      down: Boolean(input.down),
-      left: Boolean(input.left),
-      right: Boolean(input.right)
-    };
-    if (input.dash) {
-      triggerDash(p);
-    }
-  });
-
-  socket.on('playerDash', () => {
-    const p = players.get(socket.id);
-    if (p) triggerDash(p);
-  });
-
-  socket.on('disconnect', () => {
-    const p = players.get(socket.id);
-    if (!p) return;
-    players.delete(socket.id);
-    io.emit('playerLeft', { id: p.id, nickname: p.nickname });
-
-    if (players.size === 0) {
-      clearTimers();
-      gameState = GAME_STATES.WAITING;
-      meteors = [];
-      winnerInfo = null;
-    }
-  });
-});
-
-setInterval(() => {
-  stepSimulation(TICK_DT);
-  if (players.size > 0) {
-    io.emit('gameState', buildSnapshot());
-  }
-}, 1000 / TICK_RATE);
-
-if (require.main === module) {
-  server.listen(PORT, () => {
-    console.log(`Desvie dos Meteoros rodando em http://localhost:${PORT}`);
-  });
-}
-
-module.exports = { app, server };
+  },
