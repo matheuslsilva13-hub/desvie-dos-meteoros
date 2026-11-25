@@ -36,8 +36,9 @@ const ASSETS = {
   }
 };
 
-// Ajuste este valor para ficar igual à velocidade do jogador no server.js (ex: 260, 280 ou 300)
-const LOCAL_PLAYER_SPEED = 280;
+// Velocidade padrão em pixels/segundo (será sobrescrita se o server.js enviar playerSpeed no initState)
+let localPlayerSpeed = 240;
+
 const GAME_STATES = { WAITING: 'AGUARDANDO', PLAYING: 'EM_JOGO', ROUND_OVER: 'FIM_DE_RODADA' };
 const KEY_TO_DIRECTION = {
   KeyW: 'up', ArrowUp: 'up',
@@ -55,7 +56,7 @@ for (const [name, src] of Object.entries(ASSETS.characters)) {
   characterImages[name] = image;
 }
 
-// Pré-renderiza o fundo uma única vez em um canvas auxiliar para eliminar gargalo de GPU/CPU
+// Pré-renderiza o fundo uma única vez em um canvas auxiliar
 const bgCanvas = document.createElement('canvas');
 bgCanvas.width = canvas.width;
 bgCanvas.height = canvas.height;
@@ -240,8 +241,15 @@ socket.on('initState', (payload) => {
   currentState = payload;
   lastSnapshotTime = performance.now();
 
+  if (typeof payload.playerSpeed === 'number' && payload.playerSpeed > 0) {
+    localPlayerSpeed = payload.playerSpeed;
+  }
+
   const me = payload.players && payload.players[myPlayerId];
   if (me) {
+    if (typeof me.speed === 'number' && me.speed > 0) {
+      localPlayerSpeed = me.speed;
+    }
     predictedSelf = { x: me.x, y: me.y };
   }
 
@@ -257,23 +265,26 @@ socket.on('gameState', (snapshot) => {
   currentState = snapshot;
   lastSnapshotTime = performance.now();
 
-  // Reconciliação suave com a posição autoritativa do servidor
+  // Reconciliação suave com margem de tolerância para evitar puxões por latência
   const serverMe = snapshot.players && snapshot.players[myPlayerId];
   if (serverMe) {
+    if (typeof serverMe.speed === 'number' && serverMe.speed > 0) {
+      localPlayerSpeed = serverMe.speed;
+    }
     if (!predictedSelf || snapshot.gameState !== GAME_STATES.PLAYING) {
       predictedSelf = { x: serverMe.x, y: serverMe.y };
     } else {
       const dx = serverMe.x - predictedSelf.x;
       const dy = serverMe.y - predictedSelf.y;
       const dist = Math.hypot(dx, dy);
-      if (dist > 95) {
+      if (dist > 110) {
         // Teleporte ou início de rodada: sincroniza imediatamente
         predictedSelf.x = serverMe.x;
         predictedSelf.y = serverMe.y;
-      } else if (dist > 2) {
-        // Correção gradual sem trancos na tela
-        predictedSelf.x += dx * 0.18;
-        predictedSelf.y += dy * 0.18;
+      } else if (dist > 10) {
+        // Correção gradual apenas quando a divergência ultrapassar a margem de latência
+        predictedSelf.x += dx * 0.08;
+        predictedSelf.y += dy * 0.08;
       }
     }
   }
@@ -534,8 +545,8 @@ function stepLocalPrediction(dt) {
 
   if (vx !== 0 || vy !== 0) {
     const len = Math.hypot(vx, vy);
-    vx = (vx / len) * LOCAL_PLAYER_SPEED;
-    vy = (vy / len) * LOCAL_PLAYER_SPEED;
+    vx = (vx / len) * localPlayerSpeed;
+    vy = (vy / len) * localPlayerSpeed;
     const r = me.radius || 20;
     predictedSelf.x = Math.max(r, Math.min(canvas.width - r, predictedSelf.x + vx * dt));
     predictedSelf.y = Math.max(r, Math.min(canvas.height - r, predictedSelf.y + vy * dt));
@@ -552,7 +563,7 @@ function render(now) {
 
   stepLocalPrediction(dt);
 
-  // Desenha o fundo pré-renderizado (muito mais leve)
+  // Desenha o fundo pré-renderizado
   ctx.drawImage(bgCanvas, 0, 0);
 
   // Extrapolação limitada a 50 ms para evitar que meteoros atravessem a nave visualmente
